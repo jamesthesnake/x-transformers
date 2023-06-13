@@ -34,9 +34,8 @@ model = XTransformer(
 src = torch.randint(0, 256, (1, 1024))
 src_mask = torch.ones_like(src).bool()
 tgt = torch.randint(0, 256, (1, 1024))
-tgt_mask = torch.ones_like(tgt).bool()
 
-loss = model(src, tgt, src_mask = src_mask, tgt_mask = tgt_mask) # (1, 1024, 512)
+loss = model(src, tgt, mask = src_mask) # (1, 1024, 512)
 loss.backward()
 ```
 
@@ -99,7 +98,7 @@ mask = torch.ones_like(x).bool()
 model(x, mask = mask) # (1, 1024, 20000)
 ```
 
-State of the art image classification
+State of the art image classification (<a href="https://arxiv.org/abs/2205.01580">SimpleViT</a>)
 
 ```python
 import torch
@@ -203,8 +202,8 @@ img_embeds = vit(
 loss = pali(
     prompt,
     output_text,
-    src_prepend_embeds = img_embeds,            # will preprend image embeddings to encoder text embeddings before attention
-    src_mask = prompt_mask
+    mask = prompt_mask,
+    src_prepend_embeds = img_embeds             # will preprend image embeddings to encoder text embeddings before attention
 )
 
 loss.backward()
@@ -227,6 +226,7 @@ model = TransformerWrapper(
         dim = 512,
         depth = 6,
         heads = 8,
+        layer_dropout = 0.1,   # stochastic depth - dropout entire layer
         attn_dropout = 0.1,    # dropout post-attention
         ff_dropout = 0.1       # feedforward dropout
     )
@@ -237,6 +237,40 @@ model(x)
 ```
 
 ## Features
+
+### Flash Attention
+
+<img src="./images/flash-attention.png" width="500px"></img>
+
+What originally started off as <a href="https://arxiv.org/abs/2112.05682">a short paper</a> from Markus Rabe culminated as a practical fused attention CUDA kernel, named <a href="https://arxiv.org/abs/2205.14135">Flash Attention</a> by <a href="https://tridao.me/">Tri Dao</a>.
+
+The technique processes the attention matrix in tiles, only keeping track of the running softmax and exponentiated weighted sums. By recomputing on the backwards pass in a tiled fashion, one is able to keep the memory linear with respect to sequence length. This allows a lot of recent models  to be able to reach for longer context lengths without worrying about the memory bottleneck.
+
+Other engineering decisions made by Tri Dao led to its enormous success, namely minimizing HBM accesses so that both the forwards and backwards outperform naive attention. In other words, flash attention is not only more memory efficient, but faster as well, making it a necessity for training transformers.
+
+MetaAI has recently added the ability to use <a href="https://github.com/hazyresearch/flash-attention">Tri Dao's CUDA kernel</a> through the <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html">scaled_dot_product_attention</a> function in Pytorch 2.0. (They also have a `mem_efficient` attention, which is identical to flash attention design, just that the tiles are traversed differently)
+
+<a href="https://ai.facebook.com/blog/large-language-model-llama-meta-ai/">Llama</a> was trained using Flash Attention. The only reason to avoid it is if you require operating on the attention matrix (dynamic positional bias, talking heads, residual attention).
+
+You can use it in this repository by setting `attn_flash` to `True` and enjoy the immediate memory savings and increase in speed.
+
+ex.
+
+```python
+import torch
+from x_transformers import TransformerWrapper, Decoder, Encoder
+
+model = TransformerWrapper(
+    num_tokens = 20000,
+    max_seq_len = 1024,
+    attn_layers = Decoder(
+        dim = 512,
+        depth = 6,
+        heads = 8,
+        attn_flash = True # just set this to True if you have pytorch 2.0 installed
+    )
+)
+```
 
 ### Augmenting Self-attention with Persistent Memory
 
@@ -407,6 +441,28 @@ model = TransformerWrapper(
     )
 )
 ``````
+
+### No Bias in Feedforward
+
+Starting with <a href="https://ai.googleblog.com/2022/04/pathways-language-model-palm-scaling-to.html">PaLM</a>, there begun a trend to remove biases from the transformer all together. <a href="https://github.com/borisdayma">Boris Dayma</a> has run a number of experiments that showed removing biases from feedforwards led to increased throughput without any loss of accuracy. This was corroborated by <a href="https://arxiv.org/abs/2212.14034">yet another paper</a> investigating transformer architecture variants.
+
+You can turn off the feedforward bias as follows
+
+```python
+import torch
+from x_transformers import TransformerWrapper, Decoder, Encoder
+
+model = TransformerWrapper(
+    num_tokens = 20000,
+    max_seq_len = 1024,
+    attn_layers = Decoder(
+        dim = 512,
+        depth = 6,
+        heads = 8,
+        ff_no_bias = True  # set this to True
+    )
+)
+```
 
 ### ReLU²
 
@@ -628,34 +684,6 @@ model = TransformerWrapper(
 )
 ```
 
-### Position Infused Attention
-
-<img src="./images/pia.png" width="500px"></img>
-
-https://arxiv.org/abs/2005.12872
-
-https://ofir.io/shortformer.pdf
-
-In these two papers, the authors independently figured out a new technique where fixed sinusoidal positional embeddings are injected into the input prior to the queries and keys projection for all layers, leading to "position infused" attention, but leaving the actual tokens (values) uncolored by positional embedding. The Shortformer paper uses this property to cache the tokens for simplified recurrent type of transformer that bested Transformer-XL.
-
-I have tested this, and found that it produces better results than plain absolute positional encoding, even in the absence of recurrence. However, I have found that the T5 relative positional bias (also injected into all layers and has the same properties as PIA) performs even better. So given the option, you should just go with T5's `rel_pos_bias` above.
-
-```python
-import torch
-from x_transformers import TransformerWrapper, Decoder
-
-model = TransformerWrapper(
-    num_tokens = 20000,
-    max_seq_len = 1024,
-    attn_layers = Decoder(
-        dim = 512,
-        depth = 6,
-        heads = 8,
-        position_infused_attn = True  # turns on position infused attention
-    )
-)
-```
-
 ### Residual Attention
 
 <img src="./images/residual_attn.png" width="500px"></img>
@@ -759,6 +787,25 @@ logits2, mems2  = model_xl(seg2, mems = mems1, return_mems = True)
 logits3, mems3  = model_xl(seg3, mems = mems2, return_mems = True)
 ```
 
+Setting up the logic for training and sampling from transformer xl can be a bit overwhelming. This repository offers a simple wrapper that should make this easy, with the `XLAutoregressiveWrapper`.
+
+```python
+# pass in the above model_xl
+
+xl_wrapper = XLAutoregressiveWrapper(model_xl)
+
+seg = torch.randint(0, 20000, (1, 4096)).cuda()  # sequence exceeding max length, automatically segmented and memory managed
+
+loss = xl_wrapper(seg)
+loss.backward()
+
+# then, after much training
+
+prime = seg[:, :1024]   # if prime exceeds max length, memory will be caught up before generating
+
+generated = xl_wrapper.generate(prime, 4096)  # (1, 4096)
+```
+
 ### Enhanced recurrence
 
 <img src="./images/enhanced-recurrence.png" width="400px"/>
@@ -839,6 +886,24 @@ model = TransformerWrapper(
 )
 ```
 
+Update (12/2022): Rotary embedding has since been hugely successful, widely adopted in many large language models, including the largest in the world, PaLM. However, it has been uncovered in the ALiBi paper that rotary embeddings cannot length extrapolate well. This was recently addressed in <a href="https://arxiv.org/abs/2212.10554v1">a Microsoft research paper</a>. They propose a way to unobtrusively add the same decay as in ALiBi, and found that this resolves the extrapolation problem. You can use it in this repository by setting `rotary_xpos = True`. Like ALiBi, it would enforce the attention to be local. You can set the receptive field with `rotary_xpos_scale_base` value, which defaults to `512`
+
+```python
+import torch
+from x_transformers import TransformerWrapper, Decoder
+
+model = TransformerWrapper(
+    num_tokens = 20000,
+    max_seq_len = 1024,
+    attn_layers = Decoder(
+        dim = 512,
+        depth = 6,
+        heads = 8,
+        rotary_xpos = True   # modified rotary to extrapolate well beyond length at which it was trained
+    )
+)
+```
+
 ### Dynamic Positional Bias
 
 <img src="./images/dynamic-pos-bias.png" width="150px"></img>
@@ -882,12 +947,11 @@ model = TransformerWrapper(
 )
 ```
 
-
 ### ALiBi Positional Embedding
 
 <a href="https://ofir.io/train_short_test_long.pdf">This paper</a> proposes to simply apply a static linear bias to the attention matrix. The authors show this is not only effective as a relative positional encoding, but also allows the attention net to extrapolate to greater sequences length than what it was trained on, for autoregressive language models.
 
-This repository also offers a bidirectional variant (nonsymmetric), proposed by the authors <a href="https://github.com/ofirpress/attention_with_linear_biases/issues/5">here</a>.
+This repository also offers a bidirectional variant (nonsymmetric), proposed by the authors <a href="https://github.com/ofirpress/attention_with_linear_biases/issues/5">here</a>. However, this is untested. If you need bidirectional length extrapolation, the safest option would be Dynamic Position Bias
 
 Update: It may be that ALiBi enforces a strong local attention across the heads, and may hinder it from attending at distances greater than 1k. To avoid any issues with global message passing, I've decided to introduce another hyperparameter `alibi_num_heads`, so one can specify less heads for the ALiBi bias
 
@@ -981,6 +1045,32 @@ x = torch.randint(0, 20000, (1, 1024))
 model(x)
 ```
 
+### ResiDual
+
+<img src="./images/resi_dual.png" width="400px"/>
+
+<a href="https://arxiv.org/abs/2304.14802">This Microsoft paper</a> proposes yet another normalization configuration, combining both pre and post layernorm. They claim this hybridization reduces representation collapse (known to be an issue with pre-layernorm with increasing depth), while maintaining stability and reducing vanishing gradients (issues with post-layernorm). Initial experiments on my end show it to work no worse than pre-layernorm or sandwich norm. More study needed by the public to see if this is actually a winning technique.
+
+```python
+import torch
+from x_transformers import TransformerWrapper, Decoder
+
+model = TransformerWrapper(
+    num_tokens = 20000,
+    max_seq_len = 1024,
+    attn_layers = Decoder(
+        dim = 512,
+        depth = 6,
+        heads = 8,
+        resi_dual = True,               # set this to True
+        resi_dual_scale = 0.1           # in appendix, they said on fp16 the prenorm residual is prone to overflow. they claim by scaling it at each layer by a factor, it would prevent the overflow, and keep results the same (as layernorms are invariant to scaling of the input)
+    )
+)
+
+x = torch.randint(0, 20000, (1, 1024))
+model(x)
+```
+
 ### Normformer
 
 <img src="./images/normformer.png" width="400px"/>
@@ -1052,7 +1142,7 @@ model(x)
 
 The last change is a layernorm right after the outwards projection in attention. This is actually identical to the sandwich norm proposed by the Coqview paper, so you can use this by simply setting `sandwich_norm = True`, although it would also add it to the feedforward layer.
 
-### Grouped Query-Key L2 Normalization
+### Cosine Sim Attention
 
 <img src="./images/cosine-sim-attention.png" width="400px"></img>
 
@@ -1110,6 +1200,36 @@ x = torch.randint(0, 20000, (1, 1024))
 model(x)
 ```
 
+### QK RMSNorm
+
+<img src="./images/qknorm-analysis.png" width="450px"></img>
+
+Update: Google Brain has proven out something similar to cosine sim attention in <a href="https://arxiv.org/abs/2302.05442">a 22B parameter model</a>. In their papers, they have analysis showing that the normalization resulted in not only extra stability, but also better results in the end (due to less need to adjust learning rate when increasing parameter count).
+
+We are nearing the point of wiping out a source of transformer training instability with one simple intervention, in my opinion. The only slight difference in the paper is that they still have a learned scale across the feature dimension (per use of rmsnorm). Not sure how critical this is, but just to make sure we don't miss anything, I will include this here. You can use this by setting `qk_norm_dim_scale = True`
+
+<a href="https://twitter.com/Tim_Dettmers/status/1625531080513306627">Counterpoint from Tim Dettmers</a>
+
+```python
+import torch
+from x_transformers import TransformerWrapper, Decoder
+
+model = TransformerWrapper(
+    num_tokens = 20000,
+    max_seq_len = 1024,
+    attn_layers = Decoder(
+        dim = 512,
+        depth = 12,
+        heads = 8,
+        attn_qk_norm = True,
+        attn_qk_norm_dim_scale = True # set this to True, in addition to `attn_qk_norm = True`
+    )
+)
+
+x = torch.randint(0, 256, (1, 1024))
+model(x)
+```
+
 ### Turning off absolute positional embedding
 
 A number of papers have hinted that causal transformers (`Decoder`) can learn absolute positions in the absence of added embeddings of any sort. This was recently thoroughly investigated <a href="https://arxiv.org/abs/2203.16634">here</a>. You can turn off the absolute positional embedding by setting `use_abs_pos_emb = False` in the `TransformerWrapper`
@@ -1134,6 +1254,45 @@ model = TransformerWrapper(
 x = torch.randint(0, 20000, (1, 1024))
 model(x)
 ```
+
+### Forgetful Causal Mask
+
+<img src="./images/fcm.png" width="450px"></img>
+
+<a href="https://arxiv.org/abs/2210.13432">This paper</a> shows convincing results that one can combine masking (from masked language modeling) with autoregressive training, leading to significantly better results.
+
+You can use this by setting the `mask_prob` on the `AutoregressiveWrapper` class
+
+
+```python
+import torch
+from x_transformers import TransformerWrapper, Decoder, AutoregressiveWrapper
+
+model = TransformerWrapper(
+    num_tokens = 20000,
+    max_seq_len = 1024,
+    attn_layers = Decoder(
+        dim = 512,
+        depth = 12,
+        heads = 8
+    )
+)
+
+model = AutoregressiveWrapper(
+    model,
+    mask_prob = 0.15  # in paper, they use 15%, same as BERT
+).cuda()
+
+# mock data
+
+x = torch.randint(0, 20000, (1, 1024)).cuda()
+
+# derive cross entropy loss, masking all taken care of
+
+loss = model(x)
+loss.backward()
+```
+
 
 ## Miscellaneous
 
@@ -1175,9 +1334,8 @@ model = ContinuousTransformerWrapper(
 )
 
 x = torch.randn((1, 1024, 32))
-mask = torch.ones(1, 1024).bool()
 
-model(x, mask = mask) # (1, 1024, 100)
+model(x) # (1, 1024, 100)
 ```
 
 You can also train a transformer that accepts continuous values autoregressively easily, in the same scheme as done successfully in <a href="https://arxiv.org/abs/2112.05329">this paper</a>
@@ -1422,14 +1580,6 @@ generated = model.generate(start_emb, 17) # (17, 777)
 ```
 
 ```bibtex
-@misc{press2020shortformer,
-    title   = {Shortformer: Better Language Modeling using Shorter Inputs},
-    author  = {Ofir Press and Noah A. Smith and Mike Lewis},
-    year    = {2020}
-}
-```
-
-```bibtex
 @misc{press2021ALiBi,
     title   = {Train Short, Test Long: Attention with Linear Biases Enable Input Length Extrapolation},
     author  = {Ofir Press and Noah A. Smith and Mike Lewis},
@@ -1479,6 +1629,14 @@ generated = model.generate(start_emb, 17) # (17, 777)
     eprint  = {2104.09864},
     archivePrefix = {arXiv},
     primaryClass = {cs.CL}
+}
+```
+
+```bibtex
+@inproceedings{Sun2022ALT,
+  title     = {A Length-Extrapolatable Transformer},
+  author    = {Yutao Sun and Li Dong and Barun Patra and Shuming Ma and Shaohan Huang and Alon Benhaim and Vishrav Chaudhary and Xia Song and Furu Wei},
+  year      = {2022}
 }
 ```
 
@@ -1627,6 +1785,113 @@ generated = model.generate(start_emb, 17) # (17, 777)
     author  = {Imanol Schlag and Paul Smolensky and Roland Fernandez and Nebojsa Jojic and J{\"u}rgen Schmidhuber and Jianfeng Gao},
     year    = {2020},
     url     = {https://openreview.net/forum?id=B1xfElrKPr}
+}
+```
+
+```bibtex
+@article{Liu2022FCMFC,
+    title   = {FCM: Forgetful Causal Masking Makes Causal Language Models Better Zero-Shot Learners},
+    author  = {Hao Liu and Xinyang Geng and Lisa Lee and Igor Mordatch and Sergey Levine and Sharan Narang and P. Abbeel},
+    journal = {ArXiv},
+    year    = {2022},
+    volume  = {abs/2210.13432}
+}
+```
+
+```bibtex
+@inproceedings{Huang2016DeepNW,
+    title   = {Deep Networks with Stochastic Depth},
+    author  = {Gao Huang and Yu Sun and Zhuang Liu and Daniel Sedra and Kilian Q. Weinberger},
+    booktitle = {European Conference on Computer Vision},
+    year    = {2016}
+}
+```
+
+```bibtex
+@inproceedings{Hua2022TransformerQI,
+    title   = {Transformer Quality in Linear Time},
+    author  = {Weizhe Hua and Zihang Dai and Hanxiao Liu and Quoc V. Le},
+    booktitle = {International Conference on Machine Learning},
+    year    = {2022}
+}
+```
+
+```bibtex
+@article{Chang2022MaskGITMG,
+    title   = {MaskGIT: Masked Generative Image Transformer},
+    author  = {Huiwen Chang and Han Zhang and Lu Jiang and Ce Liu and William T. Freeman},
+    journal = {2022 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    year    = {2022},
+    pages   = {11305-11315}
+}
+```
+
+```bibtex
+@article{Lezama2022ImprovedMI,
+    title   = {Improved Masked Image Generation with Token-Critic},
+    author  = {Jos{\'e} Lezama and Huiwen Chang and Lu Jiang and Irfan Essa},
+    journal = {ArXiv},
+    year    = {2022},
+    volume  = {abs/2209.04439}
+}
+```
+
+```bibtex
+@misc{https://doi.org/10.48550/arxiv.2302.01327,
+    doi     = {10.48550/ARXIV.2302.01327},
+    url     = {https://arxiv.org/abs/2302.01327},
+    author  = {Kumar, Manoj and Dehghani, Mostafa and Houlsby, Neil},
+    title   = {Dual PatchNorm},
+    publisher = {arXiv},
+    year    = {2023},
+    copyright = {Creative Commons Attribution 4.0 International}
+}
+```
+
+```bibtex
+@inproceedings{dao2022flashattention,
+    title   = {Flash{A}ttention: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
+    author  = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+    booktitle = {Advances in Neural Information Processing Systems},
+    year    = {2022}
+}
+```
+
+```bibtex
+@article{Xie2023ResiDualTW,
+  title     = {ResiDual: Transformer with Dual Residual Connections},
+  author    = {Shufang Xie and Huishuai Zhang and Junliang Guo and Xu Tan and Jiang Bian and Hany Hassan Awadalla and Arul Menezes and Tao Qin and Rui Yan},
+  journal   = {ArXiv},
+  year      = {2023},
+  volume    = {abs/2304.14802}
+}
+```
+
+```bibtex
+@inproceedings{Dehghani2023ScalingVT,
+    title   = {Scaling Vision Transformers to 22 Billion Parameters},
+    author  = {Mostafa Dehghani and Josip Djolonga and Basil Mustafa and Piotr Padlewski and Jonathan Heek and Justin Gilmer and Andreas Steiner and Mathilde Caron and Robert Geirhos and Ibrahim M. Alabdulmohsin and Rodolphe Jenatton and Lucas Beyer and Michael Tschannen and Anurag Arnab and Xiao Wang and Carlos Riquelme and Matthias Minderer and Joan Puigcerver and Utku Evci and Manoj Kumar and Sjoerd van Steenkiste and Gamaleldin F. Elsayed and Aravindh Mahendran and Fisher Yu and Avital Oliver and Fantine Huot and Jasmijn Bastings and Mark Collier and Alexey A. Gritsenko and Vighnesh Birodkar and Cristina Nader Vasconcelos and Yi Tay and Thomas Mensink and Alexander Kolesnikov and Filip Paveti'c and Dustin Tran and Thomas Kipf and Mario Luvci'c and Xiaohua Zhai and Daniel Keysers and Jeremiah Harmsen and Neil Houlsby},
+    year    = {2023}
+}
+```
+
+```bibtex
+@article{Beyer2022BetterPV,
+    title   = {Better plain ViT baselines for ImageNet-1k},
+    author  = {Lucas Beyer and Xiaohua Zhai and Alexander Kolesnikov},
+    journal = {ArXiv},
+    year    = {2022},
+    volume  = {abs/2205.01580}
+}
+```
+
+```bibtex
+@article{Liu2023EfficientViTME,
+    title   = {EfficientViT: Memory Efficient Vision Transformer with Cascaded Group Attention},
+    author  = {Xinyu Liu and Houwen Peng and Ningxin Zheng and Yuqing Yang and Han Hu and Yixuan Yuan},
+    journal = {ArXiv},
+    year    = {2023},
+    volume  = {abs/2305.07027}
 }
 ```
 
